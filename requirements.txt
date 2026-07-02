@@ -3,4 +3,3 @@ python-dotenv
 groq
 PyMuPDF
 python-docx
-fpdf2
