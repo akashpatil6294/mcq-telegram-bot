@@ -6,10 +6,12 @@ import telebot
 from telebot import types
 import fitz
 from groq import Groq
+from docx import Document  # For DOCX support
+from fpdf import FPDF      # For PDF generation
 
 load_dotenv()
 
-TELEGRAM_TOKEN = "8840382763:AAGTPmY5-swbXIXg6fBKGfH2LHHzi4sRBkk"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -17,14 +19,27 @@ client = Groq(api_key=GROQ_API_KEY)
 
 user_data = {}
 
-def extract_text_from_pdf(file_path):
-    doc = fitz.open(file_path)
-    text = "\n".join(page.get_text("text") for page in doc)
-    doc.close()
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'MCQ Quiz', 0, 1, 'C')
+        self.ln(10)
+
+def extract_text(file_path, ext):
+    if ext == '.pdf':
+        doc = fitz.open(file_path)
+        text = "\n".join(page.get_text("text") for page in doc)
+        doc.close()
+    elif ext == '.docx':
+        doc = Document(file_path)
+        text = "\n".join([para.text for para in doc.paragraphs])
+    else:
+        with open(file_path, encoding='utf-8') as f:
+            text = f.read()
     return text.strip()
 
-def generate_mcqs(text, num_questions=5):
-    prompt = f"""Create exactly {num_questions} high-quality MCQs. Return only valid JSON.
+def generate_mcqs(text, num_questions=5, difficulty="medium"):
+    prompt = f"""Create exactly {num_questions} {difficulty} level MCQs. Return only valid JSON.
 
 {{
   "questions": [
@@ -48,42 +63,36 @@ Text: {text[:13000]}"""
     )
     return response.choices[0].message.content
 
-def send_long_message(chat_id, text):
-    """Split long messages"""
-    if len(text) <= 4000:
-        bot.send_message(chat_id, text, parse_mode="Markdown")
-    else:
-        for i in range(0, len(text), 4000):
-            bot.send_message(chat_id, text[i:i+4000], parse_mode="Markdown")
-
-@bot.message_handler(commands=['start'])
-def start(message):
+@bot.message_handler(commands=['start', 'help'])
+def start_help(message):
     markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("5 Questions", callback_data="num_5"))
-    markup.add(types.InlineKeyboardButton("10 Questions", callback_data="num_10"))
-    markup.add(types.InlineKeyboardButton("15 Questions", callback_data="num_15"))
+    markup.add(types.InlineKeyboardButton("Easy", callback_data="diff_easy"))
+    markup.add(types.InlineKeyboardButton("Medium", callback_data="diff_medium"))
+    markup.add(types.InlineKeyboardButton("Hard", callback_data="diff_hard"))
     
-    bot.reply_to(message, "👋 **MCQ Generator**\n\nChoose number of questions:", reply_markup=markup)
+    bot.reply_to(message, "👋 **MCQ Generator Bot**\n\nChoose difficulty level:", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("num_"))
-def callback_handler(call):
-    num = int(call.data.split("_")[1])
-    user_data[call.message.chat.id] = num
-    bot.answer_callback_query(call.id, f"Selected {num} questions")
-    bot.send_message(call.message.chat.id, f"✅ **{num} questions** selected.\n\nNow send a PDF or TXT file.")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("diff_"))
+def difficulty_handler(call):
+    diff = call.data.split("_")[1]
+    user_data[call.message.chat.id] = {"difficulty": diff, "num": 5}
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, f"✅ **{diff.capitalize()}** difficulty selected.\n\nNow send a PDF, DOCX or TXT file.")
 
 @bot.message_handler(content_types=['document'])
 def handle_doc(message):
     doc = message.document
-    if doc.file_size > 10*1024*1024:
-        return bot.reply_to(message, "❌ File too large (max 10MB)")
-
-    num_questions = user_data.get(message.chat.id, 5)
+    if doc.file_size > 15*1024*1024:
+        return bot.reply_to(message, "❌ File too large (max 15MB)")
 
     file_info = bot.get_file(doc.file_id)
     ext = os.path.splitext(doc.file_name.lower())[1]
 
-    bot.reply_to(message, f"🔄 Generating **{num_questions} MCQs**...")
+    user_pref = user_data.get(message.chat.id, {"difficulty": "medium", "num": 5})
+    num = user_pref["num"]
+    diff = user_pref["difficulty"]
+
+    bot.reply_to(message, f"🔄 Generating {num} {diff} MCQs...")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         local_path = tmp.name
@@ -91,29 +100,40 @@ def handle_doc(message):
         with open(local_path, 'wb') as f:
             f.write(file_data)
 
-    text = extract_text_from_pdf(local_path) if ext == '.pdf' else open(local_path, encoding='utf-8').read()
+    text = extract_text(local_path, ext)
     os.unlink(local_path)
 
     if len(text) < 100:
         return bot.reply_to(message, "❌ Not enough text found.")
 
     try:
-        result = generate_mcqs(text, num_questions)
+        result = generate_mcqs(text, num, diff)
         data = json.loads(result)
 
-        reply = f"📝 **{num_questions} MCQs Generated**\n\n"
-        for i, q in enumerate(data.get("questions", []), 1):
-            reply += f"**Q{i}. {q.get('question')}**\n\n"
-            for opt in q.get("options", []):
-                reply += f"{opt}\n"
-            reply += f"\n✅ **Correct: {q.get('correct')}**\n"
-            reply += f"💡 {q.get('explanation', '')}\n\n"
-            reply += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        # Create PDF
+        pdf = PDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        pdf.multi_cell(0, 10, f"MCQ Quiz - {diff.capitalize()} Level\n\n")
 
-        send_long_message(message.chat.id, reply)
+        for i, q in enumerate(data.get("questions", []), 1):
+            pdf.multi_cell(0, 10, f"Q{i}. {q.get('question')}\n")
+            for opt in q.get("options", []):
+                pdf.multi_cell(0, 10, opt)
+            pdf.multi_cell(0, 10, f"Correct: {q.get('correct')}\nExplanation: {q.get('explanation', '')}\n\n")
+
+        pdf_path = f"mcq_quiz_{message.chat.id}.pdf"
+        pdf.output(pdf_path)
+
+        # Send PDF
+        with open(pdf_path, 'rb') as f:
+            bot.send_document(message.chat.id, f, caption=f"✅ Here is your {num} {diff} MCQs")
+
+        os.unlink(pdf_path)
+
     except Exception as e:
         bot.reply_to(message, f"❌ Error: {str(e)}")
 
 if __name__ == "__main__":
-    print("🚀 MCQ Bot is Running...")
+    print("🚀 Advanced MCQ Bot is Running 24/7...")
     bot.infinity_polling()
