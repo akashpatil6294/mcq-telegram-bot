@@ -2,3 +2,5 @@ pyTelegramBotAPI
 python-dotenv
 groq
 PyMuPDF
+python-docx
+fpdf
